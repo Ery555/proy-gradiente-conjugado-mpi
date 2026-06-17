@@ -3,148 +3,173 @@
 #include <stdlib.h>
 #include <math.h>
 
-#define N 4  // Tamaño de la matriz (Para probar en red, usaremos múltiplos de 4)
-
 int main(int argc, char** argv) {
     int procesadores, procesador;
     
-    // Matriz y vectores globales (Solo el Procesador 0 los creará completos)
-    double A[N][N];
-    double b[N], x[N], r[N], p[N], w[N];
-    
-    // Cada procesador recibirá un bloque de filas. 
-    // Si N=4 y hay 4 máquinas, cada uno recibe 1 fila.
-    int filas_por_proc; 
-    
+    // 1. EL TAMAÑO N AHORA ES DINÁMICO (Por defecto 1024, o se pasa por consola)
+    int N = 1024; 
+    if (argc > 1) {
+        N = atoi(argv[1]);
+    }
+
     MPI_Init(&argc, &argv);
     MPI_Comm_size(MPI_COMM_WORLD, &procesadores);
     MPI_Comm_rank(MPI_COMM_WORLD, &procesador);
 
-    filas_por_proc = N / procesadores;
+    // Control de seguridad
+    if (N % procesadores != 0) {
+        if (procesador == 0) {
+            printf("[ERROR] El tamaño N (%d) debe ser divisible exactamente entre el numero de procesos (%d).\n", N, procesadores);
+        }
+        MPI_Finalize();
+        return 1;
+    }
+
+    int filas_por_proc = N / procesadores;
     
-    // Espacio de memoria local para las filas que le tocan a cada máquina
-    double A_local[filas_por_proc][N];
-    double w_local[filas_por_proc];
+    // 2. ASIGNACIÓN DINÁMICA DE MEMORIA (MALLOC)
+    // Usamos arreglos 1D para garantizar que la memoria sea contigua para MPI
+    double *A = NULL;
+    if (procesador == 0) {
+        A = (double*)malloc(N * N * sizeof(double));
+    }
+    
+    double *b = (double*)malloc(N * sizeof(double));
+    double *x = (double*)malloc(N * sizeof(double));
+    double *r = (double*)malloc(N * sizeof(double));
+    double *p = (double*)malloc(N * sizeof(double));
+    double *w = (double*)malloc(N * sizeof(double));
+    
+    // Memoria local de cada máquina
+    double *A_local = (double*)malloc(filas_por_proc * N * sizeof(double));
+    double *w_local = (double*)malloc(filas_por_proc * sizeof(double));
 
     // ==========================================
     // PASO 1: ENTRADA DE DATOS (PROCESADOR 0)
     // ==========================================
     if (procesador == 0) {
-        // Generar Matriz Aleatoria Simétrica Definida Positiva
         for (int i = 0; i < N; i++) {
-            for (int j = 0; j < N; j++) {
+            for (int j = 0; j <= i; j++) {
                 if (i == j) {
-                    A[i][j] = N * 10.0 + (rand() % 10); // Diagonal dominante
+                    A[i * N + j] = N * 10.0 + (rand() % 10); // Diagonal dominante
                 } else {
-                    A[i][j] = (rand() % 5) + 1.0;
-                    A[j][i] = A[i][j]; // Asegura simetría
+                    double valor = (rand() % 5) + 1.0;
+                    A[i * N + j] = valor;
+                    A[j * N + i] = valor; // Simetría
                 }
             }
-            b[i] = (rand() % 10) + 1.0; // Vector b aleatorio
-            x[i] = 0.0;                 // Aproximación inicial x_0 = 0
+            b[i] = (rand() % 10) + 1.0; 
+            x[i] = 0.0;                 
         }
-        
-        printf("[Master] Matriz y vector b generados con éxito.\n");
+        printf("[Master] Matriz simetrica de %dx%d generada en RAM.\n", N, N);
     }
 
     // ==========================================
     // PASO 2: DISTRIBUIR LOS DATOS POR LA RED
     // ==========================================
-    // Tu licenciado te enseñó MPI_Bcast y MPI_Scatter. Aquí los usamos:
-    
-    // 1. Enviamos el vector b y la aproximación x a TODOS los procesadores
     MPI_Bcast(b, N, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Bcast(x, N, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
-    // 2. Cortamos la matriz A por filas y mandamos un pedazo a cada máquina
     MPI_Scatter(A, filas_por_proc * N, MPI_DOUBLE, A_local, filas_por_proc * N, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
     // ==========================================
     // PASO 3: PREPARACIÓN DEL GRADIENTE CONJUGADO
     // ==========================================
-    // Cada máquina calcula localmente el residuo inicial r = b - A*x
-    // Como x inicial es cero, r_0 = b, y el vector de dirección p_0 = r_0
     for(int i = 0; i < N; i++) {
         r[i] = b[i];
         p[i] = r[i]; 
     }
 
-    // Variables de control del método matemático
     double alpha, beta, numerador_r, denominador_p, numerador_r_nuevo;
     int k = 0;
-    int max_iteraciones = N; // El método converge en máximo N pasos
+    int max_iteraciones = N; 
+
+    // --- ARRANQUE DEL CRONÓMETRO ---
+    // MPI_Barrier asegura que nadie inicie el reloj hasta que todos tengan sus datos
+    MPI_Barrier(MPI_COMM_WORLD);
+    double tiempo_inicio = MPI_Wtime();
 
     // ==========================================
     // PASO 4: EL BUCLE PARALELO DISTRIBUIDO
     // ==========================================
     while (k < max_iteraciones) {
         
-        // --- PRODUCTO MATRIZ-VECTOR PARALELO (Requisito III.2) ---
-        // Cada máquina multiplica SOLO las filas de la matriz que recibió (A_local)
-        // por el vector de dirección actual (p). El resultado parcial se guarda en w_local.
+        // Producto matriz-vector paralelo
         for (int i = 0; i < filas_por_proc; i++) {
             w_local[i] = 0.0;
             for (int j = 0; j < N; j++) {
-                w_local[i] += A_local[i][j] * p[j];
+                // A_local es un bloque continuo, se accede linealmente
+                w_local[i] += A_local[i * N + j] * p[j];
             }
         }
 
-        // Reunimos los pedazos calculados por cada máquina en el vector global 'w'
-        // Usamos MPI_Allgather para que todas las máquinas tengan el vector 'w' actualizado al mismo tiempo
         MPI_Allgather(w_local, filas_por_proc, MPI_DOUBLE, w, filas_por_proc, MPI_DOUBLE, MPI_COMM_WORLD);
 
-        // --- CÁLCULOS MATEMÁTICOS DE ALFA Y BETA ---
-        // Numerador: r^T * r
+        // Operaciones algebraicas (redundantes por seguridad de tiempo)
         numerador_r = 0.0;
         for(int i = 0; i < N; i++) numerador_r += r[i] * r[i];
 
-        // Denominador: p^T * w  (donde w = A * p)
         denominador_p = 0.0;
         for(int i = 0; i < N; i++) denominador_p += p[i] * w[i];
 
-        // Factor de paso alfa
         alpha = numerador_r / denominador_p;
 
-        // Actualizar el vector solución x y el residuo r
         for(int i = 0; i < N; i++) {
             x[i] = x[i] + alpha * p[i];
             r[i] = r[i] - alpha * w[i];
         }
 
-        // Nuevo numerador con el residuo actualizado
         numerador_r_nuevo = 0.0;
         for(int i = 0; i < N; i++) numerador_r_nuevo += r[i] * r[i];
 
-        // Criterio de parada: Si el residuo es casi cero, ya encontramos la solución exacta
         if (sqrt(numerador_r_nuevo) < 1e-6) {
             break;
         }
 
-        // Factor beta
         beta = numerador_r_nuevo / numerador_r;
 
-        // Actualizar vector de dirección p para la siguiente vuelta
         for(int i = 0; i < N; i++) {
-
             p[i] = r[i] + beta * p[i];
         }
 
         k++;
     }
 
+    // --- FIN DEL CRONÓMETRO ---
+    MPI_Barrier(MPI_COMM_WORLD);
+    double tiempo_fin = MPI_Wtime();
+
     // ==========================================
     // PASO 5: RECOLECCIÓN Y MUESTRA DE RESULTADOS
     // ==========================================
     if (procesador == 0) {
+        double tiempo_total = tiempo_fin - tiempo_inicio;
         printf("\n====================================\n");
-        printf("SISTEMA RESUELTO EN COMPUTACIÓN DISTRIBUIDA\n");
-        printf("Iteraciones totales: %d\n", k + 1);
-        printf("Vector Solución X resultante:\n");
-        for (int i = 0; i < N; i++) {
-            printf("x[%d] = %f\n", i, x[i]);
-        }
+        printf("SISTEMA RESUELTO EN CLUSTER DISTRIBUIDO\n");
+        printf("Nodos utilizados : %d\n", procesadores);
+        printf("Tamano matriz (N): %d\n", N);
+        printf("Iteraciones      : %d\n", (k < max_iteraciones) ? k + 1 : k);
+        printf("TIEMPO DE COMPUTO: %f segundos\n", tiempo_total);
         printf("====================================\n");
+
+        // Solo imprimimos el vector si la matriz es pequeña para no saturar la terminal
+        if (N <= 16) {
+            printf("Vector Solucion X resultante:\n");
+            for (int i = 0; i < N; i++) {
+                printf("x[%d] = %f\n", i, x[i]);
+            }
+            printf("====================================\n");
+        } else {
+            printf("(Vector solucion omitido en consola por ser muy grande)\n");
+            printf("====================================\n");
+        }
     }
+
+    // 3. LIBERACIÓN DE MEMORIA DINÁMICA
+    if (procesador == 0) {
+        free(A);
+    }
+    free(b); free(x); free(r); free(p); free(w);
+    free(A_local); free(w_local);
 
     MPI_Finalize();
     return 0;
